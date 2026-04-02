@@ -22,7 +22,7 @@ class SessionData(TypedDict):
     last_active_time: float
     pending_auto: bool
 
-@register("token_tracker", "Lystars", 
+@register("Token_Tracker", "Lystars", 
           "输入/token以查看对话段token统计信息，支持自动统计、自动重置和自动清理", 
           "1.2.0")
 class TokenTracker(Star):
