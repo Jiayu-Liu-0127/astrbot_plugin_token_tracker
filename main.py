@@ -101,15 +101,14 @@ class TokenTracker(Star):
                 platform = getattr(event, 'platform_name', 'unknown')
                 user_id = getattr(event, 'user_id', 'unknown')
                 return f"{platform}_fallback_user{user_id}"
-            except:
+            except Exception:
                 # 最后的手段，但比id(event)稳定
                 return "global_fallback_session"
     
     def _get_session_lock(self, sid: str) -> asyncio.Lock:
-        """获取或创建会话锁"""
-        if sid not in self._session_locks:
-            self._session_locks[sid] = asyncio.Lock()
-        return self._session_locks[sid]
+        """获取或创建会话锁 - 带并发安全的原子操作"""
+        # 注：由于dict.setdefault是原子的，这里是线程安全的
+        return self._session_locks.setdefault(sid, asyncio.Lock())
     
     def _init_session_stats(self, sid: str) -> SessionStats:
         """初始化或重置会话的当前统计"""
@@ -118,11 +117,11 @@ class TokenTracker(Star):
                 current=None,
                 last_token_time=None,
                 session_start=time.monotonic(),
-                last_active_time=time.monotonic(),  # 最后活跃时间
+                last_active_time=time.monotonic(),
                 pending_auto=False
             )
         
-        # 初始化当前统计
+        # 重置当前统计字段，保持其他字段不变
         current_stats: SessionStats = {
             "prompt": 0, 
             "completion": 0, 
@@ -133,62 +132,73 @@ class TokenTracker(Star):
         self.stats[sid]["current"] = current_stats
         return current_stats
     
-    def _get_current_stats(self, sid: str) -> SessionStats:
-        """获取当前统计，如果不存在则初始化"""
-        if sid not in self.stats or self.stats[sid]["current"] is None:
+    def _ensure_session_initialized(self, sid: str) -> None:
+        """确保会话已初始化，但不重置统计"""
+        if sid not in self.stats:
+            self.stats[sid] = SessionData(
+                current=None,
+                last_token_time=None,
+                session_start=time.monotonic(),
+                last_active_time=time.monotonic(),
+                pending_auto=False
+            )
+    
+    def _get_current_stats(self, sid: str) -> Optional[SessionStats]:
+        """获取当前统计，如果不存在则初始化或返回None"""
+        if sid not in self.stats:
+            return None
+        current = self.stats[sid]["current"]
+        if current is None:
+            # 尝试初始化一次
             return self._init_session_stats(sid)
-        return self.stats[sid]["current"]  # type: ignore
+        return current
     
     def _check_auto_token(self, sid: str) -> bool:
-        """检查是否应该执行自动统计"""
+        """检查是否需要自动统计 - 纯检查函数，无副作用"""
+        interval_seconds = self.auto_interval_hours * 60 * 60
+        now = time.monotonic()
+        
         if sid not in self.stats:
             return False
         
         data = self.stats[sid]
-        now = time.monotonic()  # 统一时间戳
-        interval_seconds = self.auto_interval_hours * 60 * 60
         
-        # 检查会话是否过期 - 基于最后活跃时间
-        last_active = data["last_active_time"]
-        if now - last_active > self.session_ttl:
-            # 会话过期，清理
-            del self.stats[sid]
-            if sid in self._session_locks:
-                del self._session_locks[sid]
-            return False
-        
-        # 检查是否需要自动统计
+        # 只检查是否需要自动统计，不删除会话
         last_token_time = data["last_token_time"]
         session_start = data["session_start"]
         
         if last_token_time is None:
-            # 从未使用过/token，从会话创建时间开始计算
-            if session_start > 0 and now - session_start >= interval_seconds:
+            # 从未执行过自动统计，从会话创建时间开始计算
+            if now - session_start >= interval_seconds:
                 return True
-        elif now - last_token_time >= interval_seconds:
-            return True
+        else:
+            # 已执行过至少一次自动统计，从上次统计时间计算
+            if now - last_token_time >= interval_seconds:
+                return True
         
         return False
     
     async def _execute_auto_token(self, event: AstrMessageEvent, sid: str):
-        """执行自动统计并发送消息 - 修复先清零后发送的问题"""
-        if sid not in self.stats or self.stats[sid]["current"] is None:
-            return
-        
-        current_stats = self.stats[sid]["current"]
+        """执行自动统计并发送消息 - 防止TOCTOU竞态条件"""
         now = time.monotonic()
         
-        if current_stats["count"] == 0:
-            # 没有统计记录时也要清除状态
-            if sid in self.stats:
-                self.stats[sid]["pending_auto"] = False
-                self.stats[sid]["last_token_time"] = now
-                self.stats[sid]["last_active_time"] = now
+        # 首次检查
+        if sid not in self.stats:
             return
         
-        # 计算距离上次统计的时间
-        last_token_time = self.stats[sid]["last_token_time"]
-        session_start = self.stats[sid]["session_start"]
+        stats_data = self.stats[sid]
+        current_stats = stats_data["current"]
+        if current_stats is None or current_stats["count"] == 0:
+            # 没有统计记录时更新状态
+            stats_data["pending_auto"] = False
+            stats_data["last_token_time"] = now
+            stats_data["last_active_time"] = now
+            return
+        
+        # 保存当前统计数据的副本，避免后续调用中被修改
+        stats_copy = dict(current_stats)
+        last_token_time = stats_data["last_token_time"]
+        session_start = stats_data["session_start"]
         
         if last_token_time is None:
             elapsed_hours = (now - session_start) / 3600
@@ -197,33 +207,31 @@ class TokenTracker(Star):
         
         # 生成自动统计信息
         auto_msg = f"""⏰ 定时Token统计（已{elapsed_hours:.1f}小时未查看）：
-• 请求次数：{current_stats['count']}次
-• 输入Token：{current_stats['prompt']}个
-• 输出Token：{current_stats['completion']}个
-• 总计Token：{current_stats['total']}个
+• 请求次数：{stats_copy['count']}次
+• 输入Token：{stats_copy['prompt']}个
+• 输出Token：{stats_copy['completion']}个
+• 总计Token：{stats_copy['total']}个
 
 （统计已重置，下一轮定时统计将在{self.auto_interval_hours}小时后进行）"""
         
         try:
-            # 修复：先发送消息，成功后再重置统计
+            # 先发送消息
             await event.send(event.plain_result(auto_msg))
             
-            # 发送成功，重置当前统计
-            self._init_session_stats(sid)
-            # 更新最后统计时间和活跃时间
-            self.stats[sid]["last_token_time"] = now
-            self.stats[sid]["last_active_time"] = now
-            # 清除待处理标志
-            self.stats[sid]["pending_auto"] = False
-            
-            logger.info(f"自动统计执行成功: {sid}, 消耗={current_stats['total']}tokens, 间隔={elapsed_hours:.1f}小时")
+            # 发送成功后再修改状态（减少持有数据的时间窗口）
+            if sid in self.stats:
+                self._init_session_stats(sid)
+                self.stats[sid]["last_token_time"] = now
+                self.stats[sid]["last_active_time"] = now
+                self.stats[sid]["pending_auto"] = False
+                
+                logger.info(f"自动统计执行成功: {sid}, 消耗={stats_copy['total']}tokens, 间隔={elapsed_hours:.1f}小时")
             
         except Exception as send_error:
-            # 发送失败，保留统计数据和状态
+            # 发送失败，保留统计数据
             logger.error(f"自动统计发送失败（统计保留）: {sid}, 错误: {send_error}")
-            # 记录发送失败，但不清除pending_auto，下次再尝试
-            # 更新活跃时间，避免会话过期
-            self.stats[sid]["last_active_time"] = now
+            if sid in self.stats:
+                self.stats[sid]["last_active_time"] = now
     
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -234,9 +242,11 @@ class TokenTracker(Star):
             try:
                 now = time.monotonic()  # 统一时间戳
                 
+                # 确保会话已初始化
+                self._ensure_session_initialized(sid)
+                
                 # 更新最后活跃时间（无论是否有usage，用户发送消息就算活跃）
-                if sid in self.stats:
-                    self.stats[sid]["last_active_time"] = now
+                self.stats[sid]["last_active_time"] = now
                 
                 # 检查是否需要自动统计（在记录新token之前检查）
                 should_auto = self._check_auto_token(sid)
@@ -248,18 +258,20 @@ class TokenTracker(Star):
                 usage = resp.raw_completion.usage if resp.raw_completion else None
                 if usage:
                     stats = self._get_current_stats(sid)
-                    
-                    # 安全处理usage字段，避免None值
-                    prompt_tokens = int(usage.prompt_tokens or 0)
-                    completion_tokens = int(usage.completion_tokens or 0)
-                    total_tokens = int(usage.total_tokens or 0)
-                    
-                    stats["prompt"] += prompt_tokens
-                    stats["completion"] += completion_tokens
-                    stats["total"] += total_tokens
-                    stats["count"] += 1
-                    
-                    logger.debug(f"记录token: {sid}, 本次={total_tokens}, 累计={stats['total']}")
+                    if stats is not None:
+                        # 安全处理usage字段，避免None值
+                        prompt_tokens = int(usage.prompt_tokens or 0)
+                        completion_tokens = int(usage.completion_tokens or 0)
+                        total_tokens = int(usage.total_tokens or 0)
+                        
+                        stats["prompt"] += prompt_tokens
+                        stats["completion"] += completion_tokens
+                        stats["total"] += total_tokens
+                        stats["count"] += 1
+                        
+                        logger.debug(f"记录token: {sid}, 本次={total_tokens}, 累计={stats['total']}")
+                    else:
+                        logger.warning(f"无法获取会话统计数据: {sid}")
                 else:
                     # 即使没有usage也记录日志
                     logger.debug(f"收到LLM响应但无usage信息: {sid}")
@@ -268,20 +280,20 @@ class TokenTracker(Star):
                 self._cleanup_expired_sessions()
                 
                 # 如果有待处理的自动统计，执行它
-                # 注意：这里执行的是上一统计段的自动统计
-                if sid in self.stats and self.stats[sid]["pending_auto"]:
+                need_auto_token = sid in self.stats and self.stats[sid]["pending_auto"]
+                if need_auto_token:
                     try:
                         await self._execute_auto_token(event, sid)
                     except Exception as auto_error:
                         logger.error(f"自动统计执行失败: {sid}, 错误: {auto_error}")
                         # 自动统计失败不影响主流程
-                        
+                
             except (ValueError, TypeError, AttributeError) as e:
                 # 可恢复的结构异常
-                logger.warning(f"LLM响应处理遇到可恢复异常: {sid}, 错误: {e}, 堆栈: {traceback.format_exc(limit=5)}")
+                logger.warning(f"LLM响应处理遇到可恢复异常: {sid}, 错误: {e}, 堆栈: {traceback.format_exc(limit=3)}")
             except Exception as e:
                 # 其他不可预见的异常
-                logger.error(f"处理LLM响应遇到未预期异常: {sid}, 错误: {e}, 完整堆栈: {traceback.format_exc()}")
+                logger.error(f"处理LLM响应遇到未预期异常: {sid}, 错误: {e}, 堆栈摘要: {traceback.format_exc(limit=10)}")
     
     @filter.command("token")
     async def show_token(self, event: AstrMessageEvent):
@@ -296,16 +308,18 @@ class TokenTracker(Star):
                 
                 now = time.monotonic()
                 
+                # 确保会话已初始化
+                self._ensure_session_initialized(sid)
+                
                 # 更新最后活跃时间（用户使用命令也算活跃）
-                if sid in self.stats:
-                    self.stats[sid]["last_active_time"] = now
-                    self.stats[sid]["last_token_time"] = now
-                    self.stats[sid]["pending_auto"] = False
+                self.stats[sid]["last_active_time"] = now
+                self.stats[sid]["last_token_time"] = now
+                self.stats[sid]["pending_auto"] = False
                 
                 # 获取当前统计
-                current_stats = self._get_current_stats(sid) if sid in self.stats else None
+                current_stats = self.stats[sid]["current"]
                 
-                if current_stats and current_stats["count"] > 0:
+                if current_stats is not None and current_stats["count"] > 0:
                     msg = f"""📊 本段对话Token统计：
 • 请求次数：{current_stats['count']}次
 • 输入Token：{current_stats['prompt']}个
@@ -325,10 +339,10 @@ class TokenTracker(Star):
                 yield event.plain_result(msg)
                 
             except Exception as e:
-                logger.error(f"处理/token命令失败: {sid}, 错误: {e}, 堆栈: {traceback.format_exc()}")
+                logger.error(f"处理/token命令失败: {sid}, 错误: {e}, 堆栈摘要: {traceback.format_exc(limit=5)}")
                 yield event.plain_result("统计查询失败，请稍后重试。")
     
-    def _cleanup_expired_sessions(self):
+    def _cleanup_expired_sessions(self) -> int:
         """清理过期会话 - 基于最后活跃时间，带性能优化"""
         now = time.monotonic()  # 统一时间戳
         
@@ -339,14 +353,17 @@ class TokenTracker(Star):
         self.last_cleanup_time = now
         expired_sids = []
         
-        for sid, data in self.stats.items():
+        # 先收集所有过期的 session ID，避免遍历时修改字典
+        for sid, data in list(self.stats.items()):
             # 使用最后活跃时间判断过期
             last_active = data["last_active_time"]
             if now - last_active > self.session_ttl:
                 expired_sids.append(sid)
         
+        # 清理过期会话及其关联的锁
         for sid in expired_sids:
             del self.stats[sid]
+            # 同时清理对应的锁，避免内存泄漏
             if sid in self._session_locks:
                 del self._session_locks[sid]
             logger.debug(f"清理过期会话: {sid}")
