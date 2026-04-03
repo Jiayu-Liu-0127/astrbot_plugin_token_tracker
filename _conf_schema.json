@@ -31,7 +31,7 @@
     "type": "int",
     "description": "持久化保存间隔（分钟）",
     "hint": "建议 5 分钟，可根据需求调整至更低（如 1 分钟）以减少数据丢失风险",
-    "default": 5,
+    "default": 5.0,
     "minimum": 1,
     "maximum": 60
   }

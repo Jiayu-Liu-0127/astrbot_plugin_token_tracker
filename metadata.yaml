@@ -1,18 +1,17 @@
-name: astrbot_plugin_Token_Tracker
+name: Token_Tracker
 version: 1.2.0
 author: Lystars
-description: 输入/token以查看对话段token统计信息，支持自动统计、自动重置和自动清理
-entry: main.py
-dependencies: []
-events:
-  - on_llm_response
-  - command
-permissions:
-  - read
-  - write
-config:
-  - interval_hours
-  - session_ttl_hours
-  - persist_interval_minutes
-  - persist_enabled
-repo: https://github.com/Jiayu-Liu-0127/astrbot_plugin_Token_Tracker
+description: 输入/token以查看token统计信息，支持自动统计，自动管理和数据持久化
+homepage: ''
+license: MIT
+tags:
+- token
+- statistics
+- monitoring
+requirements: []
+supported_adapters:
+- ~onebot.v11
+- ~telegram
+- ~kaiheila
+- ~qqguild
+repo: https://github.com/Jiayu-Liu-0127/astrbot_plugin_TokenTracker
